@@ -220,8 +220,8 @@ flowchart TD
     REQ["POST /api/cats {ownerId}"] --> H{"Owner's home cell<br/>= this cell?"}
     H -->|yes| L["Write to OWN account<br/>path = local"]
     H -->|no| F{"Peer cell reachable?<br/>(internal LB over peering, 5 s timeout)"}
-    F -->|yes| FW["Forward request to home cell<br/>it writes locally<br/>path = forwarded from &lt;cell&gt;"]
-    F -->|no| D["Write DIRECTLY to the home cell's ACCOUNT<br/>(its current write region)<br/>path = direct to &lt;cell&gt; account"]
+    F -->|yes| FW["Forward request to home cell<br/>it writes locally<br/>path = forwarded from (cell)"]
+    F -->|no| D["Write DIRECTLY to the home cell's ACCOUNT<br/>(its current write region)<br/>path = direct to (cell) account"]
 ```
 
 ### Data flows
@@ -345,7 +345,7 @@ sequenceDiagram
     U->>FD: POST /api/cats
     FD->>A2: Private Link
     A2->>W: create → always the account's current write region (cross-region)
-    W-->>A2: 201 (≈ 25–35 ms West Europe↔Sweden; ≈ 130–150 ms Central India↔Sweden)
+    W-->>A2: 201 (≈ 25–35 ms West Europe↔Sweden, ≈ 130–150 ms Central India↔Sweden)
     W--)R: async replication
     Note over W,R: Failover (service-managed or cosmos-failover) makes Sweden Central the write region → Sweden writes become local, primary-region writes become cross-region
 ```
