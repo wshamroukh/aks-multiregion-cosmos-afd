@@ -340,13 +340,17 @@ test_from_vm() {
   tvm_resolve || die "TEST_VM_REGION=$TEST_VM_REGION is not one of this deployment's regions ($REGION1, $REGION2)"
   host=$(az afd endpoint show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" --query hostName -o tsv)
   log "Calling https://$host/api/info 6 times from $VM_NAME ($TEST_VM_REGION)"
+  info "Front Door endpoint: $(az afd endpoint show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" --query deploymentStatus -o tsv 2>/dev/null), route: $(az afd route show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" --route-name default --query deploymentStatus -o tsv 2>/dev/null || echo missing)"
   ps=$(cat <<'PS'
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-1..6 | ForEach-Object {
+foreach ($i in 1..6) {
   try {
     $r = Invoke-RestMethod -Uri 'https://__AFD__/api/info' -TimeoutSec 20 -Headers @{ 'Cache-Control'='no-cache' }
-    "call $($_): served by AKS region = $($r.region)  pod = $($r.pod)"
-  } catch { "call $($_): ERROR $($_.Exception.Message)" }
+    "call ${i}: served by AKS region = $($r.region)  pod = $($r.pod)"
+  } catch {
+    $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'n/a' }
+    "call ${i}: ERROR HTTP $code - $($_.Exception.Message)"
+  }
   Start-Sleep -Seconds 2
 }
 PS
