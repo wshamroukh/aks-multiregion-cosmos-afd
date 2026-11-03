@@ -16,13 +16,15 @@
 #
 #  Usage:
 #     ./aks-multiregion-cosmos-afd.sh            # deploy (re-runnable)
-#     ./aks-multiregion-cosmos-afd.sh destroy    # delete everything (waits + purges vaults)
-#     ./aks-multiregion-cosmos-afd.sh destroy --no-wait
-#     ./aks-multiregion-cosmos-afd.sh testvm     # Windows test VM in REGION2 (after deploy)
+#     ./aks-multiregion-cosmos-afd.sh destroy    # delete everything (background; --wait to wait + purge vaults)
+#     ./aks-multiregion-cosmos-afd.sh destroy --wait
+#     ./aks-multiregion-cosmos-afd.sh testvm     # (re)create the Sweden Central test VM (also done by every deploy)
 #     ./aks-multiregion-cosmos-afd.sh testvm-run # re-run the Front Door test from that VM
 #  Optional env vars:
 #     API_AUTHORIZED_IPS=x.x.x.x/32   restrict the AKS API servers to these IPs
 #     FORCE_BUILD=true                rebuild the app image
+#     SKIP_TEST_VM=true               don't create the Windows test VM + Bastion Developer
+#     TEST_VM_REGION=swedencentral    region (one of the two) for the test VM
 #     REGION2=swedencentral           2nd region for everything (default Sweden Central)
 #     COSMOS_REGION2=<region>         override only the 2nd Cosmos DB write region
 #     COSMOS_REGION2_CANDIDATES="a b" fallback list for the 2nd write region, in order
@@ -62,8 +64,8 @@ SUFFIX="${SUFFIX:-$(gen_suffix)}"
 IMAGE_BUILT="${IMAGE_BUILT:-}"
 save_state() { printf 'SUFFIX=%s\nIMAGE_BUILT=%s\n' "$SUFFIX" "$IMAGE_BUILT" > "$STATE_FILE"; }
 
-RG_GLOBAL="rg-${PREFIX}-global"
-RG1="rg-${PREFIX}-${R1}";  RG2="rg-${PREFIX}-${R2}"
+RG_GLOBAL="rg-${PREFIX}-global-${SUFFIX}"
+RG1="rg-${PREFIX}-${R1}-${SUFFIX}";  RG2="rg-${PREFIX}-${R2}-${SUFFIX}"
 ACR="acr${PREFIX}${SUFFIX}"
 COSMOS="cosmos-${PREFIX}-${SUFFIX}"
 AKS1="aks-${PREFIX}-${R1}";  AKS2="aks-${PREFIX}-${R2}"
@@ -292,18 +294,30 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 APP_SRC_EOF
 }
 
-# ----------------------------- Test VM (REGION2) ----------------------------
-# Windows Server 2025 VM inside the REGION2 VNet to browse the Front Door URL from
-# that region: Front Door routes it to the nearest healthy origin = REGION2's AKS.
-#  * no public IP on the VM; RDP through Azure Bastion (browser, Azure portal)
+# ----------------------------- Test VM (Sweden Central) ---------------------
+# Always created at the end of a deployment (SKIP_TEST_VM=true to skip), in the cell /
+# region that matches TEST_VM_REGION (default swedencentral): a Windows Server 2025 VM
+# inside that region's VNet to browse the Front Door URL from there -> Front Door
+# routes it to the nearest healthy origin = that region's AKS.
+#  * no public IP on the VM; RDP from the Azure portal through Azure Bastion DEVELOPER
+#    (free, shared pool: no AzureBastionSubnet, no public IP, one session at a time,
+#     same-VNet VMs only). BASTION_SKU=Basic|Standard for a dedicated host instead.
 #  * outbound internet through a NAT gateway (new VNets have no default outbound access)
-VM_NAME="vm-afdtest-${R2}"                    # <= 15 chars (Windows computer name)
+TEST_VM_REGION="${TEST_VM_REGION:-swedencentral}"
 VM_ADMIN="azureadmin"
 VM_CRED_FILE="$HOME/.${PREFIX}-testvm.txt"
+tvm_resolve() { # sets TVM_RG / TVM_VNET / TVM_CIDR / TVM_R / TVM_AKS / VM_NAME, or returns 1
+  if   [[ "$TEST_VM_REGION" == "$REGION2" ]]; then TVM_RG=$RG2; TVM_VNET=$VNET2; TVM_CIDR=$VNET2_CIDR; TVM_R=$R2; TVM_AKS=$AKS2
+  elif [[ "$TEST_VM_REGION" == "$REGION1" ]]; then TVM_RG=$RG1; TVM_VNET=$VNET1; TVM_CIDR=$VNET1_CIDR; TVM_R=$R1; TVM_AKS=$AKS1
+  else return 1; fi
+  VM_NAME="vm-afdtest-${TVM_R}"               # <= 15 chars (Windows computer name)
+  TVM_REGION_NAME=$(az account list-locations --query "[?name=='$TEST_VM_REGION'].displayName" -o tsv)
+}
 test_from_vm() {
   local host ps
+  tvm_resolve || die "TEST_VM_REGION=$TEST_VM_REGION is not one of this deployment's regions ($REGION1, $REGION2)"
   host=$(az afd endpoint show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" --query hostName -o tsv)
-  log "Calling https://$host/api/info 6 times from $VM_NAME ($REGION2)"
+  log "Calling https://$host/api/info 6 times from $VM_NAME ($TEST_VM_REGION)"
   ps=$(cat <<'PS'
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 1..6 | ForEach-Object {
@@ -316,41 +330,77 @@ test_from_vm() {
 PS
 )
   ps=${ps//__AFD__/$host}
-  az vm run-command invoke -g "$RG2" -n "$VM_NAME" --command-id RunPowerShellScript --scripts "$ps" \
+  az vm run-command invoke -g "$TVM_RG" -n "$VM_NAME" --command-id RunPowerShellScript --scripts "$ps" \
     --query "value[0].message" -o tsv | sed 's/^/    /'
+  info "(errors right after a fresh deployment usually mean Front Door is still propagating -"
+  info " try again in 10-15 min with: $0 testvm-run)"
+}
+create_bastion() {
+  local bas="bas-${PREFIX}-${TVM_R}" sku="${BASTION_SKU:-Developer}" basip vnet_id body
+  if az network bastion show -g "$TVM_RG" -n "$bas" >/dev/null 2>&1; then info "Bastion $bas already exists"; return; fi
+  if [[ "$sku" == "Developer" ]]; then
+    log "[$TEST_VM_REGION] Azure Bastion Developer $bas (free, no subnet / public IP)"
+    if ! az network bastion create -g "$TVM_RG" -n "$bas" -l "$TEST_VM_REGION" --vnet-name "$TVM_VNET" \
+         --sku Developer -o none 2>/tmp/${PREFIX}-bastion.err; then
+      # Older CLI versions: create it through Azure Resource Manager instead
+      vnet_id=$(az network vnet show -g "$TVM_RG" -n "$TVM_VNET" --query id -o tsv)
+      body=$(jq -n --arg loc "$TEST_VM_REGION" --arg vnet "$vnet_id" \
+        '{location:$loc, sku:{name:"Developer"}, properties:{virtualNetwork:{id:$vnet}, ipConfigurations:[]}}')
+      az rest --method put -o none \
+        --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${TVM_RG}/providers/Microsoft.Network/bastionHosts/${bas}?api-version=2023-09-01" \
+        --body "$body" || { cat /tmp/${PREFIX}-bastion.err >&2; info "WARNING: Bastion not created - connect another way (or BASTION_SKU=Basic)"; return; }
+    fi
+  else
+    log "[$TEST_VM_REGION] Azure Bastion $sku $bas (dedicated host, ~10 min)"
+    basip="pip-bas-${PREFIX}-${TVM_R}"
+    az network vnet subnet show -g "$TVM_RG" --vnet-name "$TVM_VNET" -n AzureBastionSubnet >/dev/null 2>&1 || \
+      az network vnet subnet create -g "$TVM_RG" --vnet-name "$TVM_VNET" -n AzureBastionSubnet --address-prefixes "${TVM_CIDR}.11.0/26" -o none
+    az network public-ip show -g "$TVM_RG" -n "$basip" >/dev/null 2>&1 || \
+      az network public-ip create -g "$TVM_RG" -n "$basip" -l "$TEST_VM_REGION" --sku Standard --allocation-method Static -o none
+    az network bastion create -g "$TVM_RG" -n "$bas" -l "$TEST_VM_REGION" --vnet-name "$TVM_VNET" \
+      --public-ip-address "$basip" --sku "$sku" -o none
+  fi
+  info "Bastion $bas ready"
 }
 create_test_vm() {
-  local c="$VNET2_CIDR" nsg="nsg-${VM_NAME}" ng="ng-${PREFIX}-${R2}" ngip="pip-ng-${PREFIX}-${R2}"
-  local bas="bas-${PREFIX}-${R2}" basip="pip-bas-${PREFIX}-${R2}" size pw out cand
+  tvm_resolve || { info "Test VM skipped: TEST_VM_REGION=$TEST_VM_REGION is not one of $REGION1 / $REGION2"; return 0; }
+  local c="$TVM_CIDR" nsg="nsg-vm-afdtest-${TVM_R}" ng="ng-${PREFIX}-${TVM_R}" ngip="pip-ng-${PREFIX}-${TVM_R}" size pw out cand
   az afd endpoint show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" >/dev/null 2>&1 || \
     die "Front Door $AFD_PROFILE not found - run the full deployment first"
-  az network vnet show -g "$RG2" -n "$VNET2" >/dev/null 2>&1 || die "$VNET2 not found - run the full deployment first"
+  az network vnet show -g "$TVM_RG" -n "$TVM_VNET" >/dev/null 2>&1 || die "$TVM_VNET not found - run the full deployment first"
 
-  log "[$REGION2] Test VM network: subnet snet-vm (${c}.10.0/24) + NAT gateway + NSG"
-  az network nsg show -g "$RG2" -n "$nsg" >/dev/null 2>&1 || \
-    az network nsg create -g "$RG2" -n "$nsg" -l "$REGION2" -o none   # default rules: no inbound from internet
-  az network public-ip show -g "$RG2" -n "$ngip" >/dev/null 2>&1 || \
-    az network public-ip create -g "$RG2" -n "$ngip" -l "$REGION2" --sku Standard --allocation-method Static -o none
-  az network nat gateway show -g "$RG2" -n "$ng" >/dev/null 2>&1 || \
-    az network nat gateway create -g "$RG2" -n "$ng" -l "$REGION2" --public-ip-addresses "$ngip" --idle-timeout 10 -o none
-  az network vnet subnet show -g "$RG2" --vnet-name "$VNET2" -n snet-vm >/dev/null 2>&1 || \
-    az network vnet subnet create -g "$RG2" --vnet-name "$VNET2" -n snet-vm --address-prefixes "${c}.10.0/24" \
+  log "[$TEST_VM_REGION] Test VM network: subnet snet-vm (${c}.10.0/24) + NAT gateway + NSG"
+  az network nsg show -g "$TVM_RG" -n "$nsg" >/dev/null 2>&1 || \
+    az network nsg create -g "$TVM_RG" -n "$nsg" -l "$TEST_VM_REGION" -o none   # default rules: no inbound from internet
+  # Bastion Developer reaches the VM from the Azure platform IP 168.63.129.16
+  az network nsg rule show -g "$TVM_RG" --nsg-name "$nsg" -n allow-bastion-dev-rdp >/dev/null 2>&1 || \
+    az network nsg rule create -g "$TVM_RG" --nsg-name "$nsg" -n allow-bastion-dev-rdp --priority 200 \
+      --direction Inbound --access Allow --protocol Tcp --source-address-prefixes 168.63.129.16 \
+      --destination-port-ranges 3389 -o none
+  az network public-ip show -g "$TVM_RG" -n "$ngip" >/dev/null 2>&1 || \
+    az network public-ip create -g "$TVM_RG" -n "$ngip" -l "$TEST_VM_REGION" --sku Standard --allocation-method Static -o none
+  az network nat gateway show -g "$TVM_RG" -n "$ng" >/dev/null 2>&1 || \
+    az network nat gateway create -g "$TVM_RG" -n "$ng" -l "$TEST_VM_REGION" --public-ip-addresses "$ngip" --idle-timeout 10 -o none
+  az network vnet subnet show -g "$TVM_RG" --vnet-name "$TVM_VNET" -n snet-vm >/dev/null 2>&1 || \
+    az network vnet subnet create -g "$TVM_RG" --vnet-name "$TVM_VNET" -n snet-vm --address-prefixes "${c}.10.0/24" \
       --network-security-group "$nsg" --nat-gateway "$ng" -o none
 
-  if az vm show -g "$RG2" -n "$VM_NAME" >/dev/null 2>&1; then
+  if az vm show -g "$TVM_RG" -n "$VM_NAME" >/dev/null 2>&1; then
     info "$VM_NAME already exists"
+    [[ "$(az vm get-instance-view -g "$TVM_RG" -n "$VM_NAME" --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv)" == "PowerState/running" ]] || \
+      { info "starting $VM_NAME"; az vm start -g "$TVM_RG" -n "$VM_NAME" -o none; }
   else
     # Same size the subscription already allows for AKS nodes in this region (override: TEST_VM_SIZE)
-    size="${TEST_VM_SIZE:-$(az aks show -g "$RG2" -n "$AKS2" --query 'agentPoolProfiles[0].vmSize' -o tsv 2>/dev/null)}"
+    size="${TEST_VM_SIZE:-$(az aks show -g "$TVM_RG" -n "$TVM_AKS" --query 'agentPoolProfiles[0].vmSize' -o tsv 2>/dev/null)}"
     size="${size:-Standard_B2s_v2}"
     pw="Cc9#$(openssl rand -hex 10 2>/dev/null || echo "$RANDOM$RANDOM$RANDOM$RANDOM")"
-    log "[$REGION2] Creating Windows Server 2025 VM $VM_NAME (no public IP)"
+    log "[$TEST_VM_REGION] Creating Windows Server 2025 VM $VM_NAME (no public IP)"
     for cand in "$size" Standard_B2s_v2 Standard_B2as_v2 Standard_D2s_v5 Standard_D2as_v5; do
       info "trying size $cand"
-      if out=$(az vm create -g "$RG2" -n "$VM_NAME" -l "$REGION2" \
+      if out=$(az vm create -g "$TVM_RG" -n "$VM_NAME" -l "$TEST_VM_REGION" \
           --image MicrosoftWindowsServer:WindowsServer:2025-datacenter-azure-edition:latest \
           --size "$cand" --admin-username "$VM_ADMIN" --admin-password "$pw" \
-          --vnet-name "$VNET2" --subnet snet-vm --public-ip-address "" --nsg "" \
+          --vnet-name "$TVM_VNET" --subnet snet-vm --public-ip-address "" --nsg "" \
           --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true \
           --os-disk-delete-option Delete --nic-delete-option Delete -o none 2>&1); then
         size=$cand; break
@@ -358,40 +408,39 @@ create_test_vm() {
       grep -qiE 'not allowed|SkuNotAvailable|not available|NotAvailableForSubscription|quota' <<<"$out" || die "VM create failed: $out"
       size=""
     done
-    [[ -n "$size" ]] || die "No allowed VM size for $VM_NAME in $REGION2: $out"
-    printf 'VM: %s (%s, %s)\nUser: %s\nPassword: %s\n' "$VM_NAME" "$RG2" "$size" "$VM_ADMIN" "$pw" > "$VM_CRED_FILE"
+    [[ -n "$size" ]] || die "No allowed VM size for $VM_NAME in $TEST_VM_REGION: $out"
+    printf 'VM: %s (%s, %s)\nUser: %s\nPassword: %s\n' "$VM_NAME" "$TVM_RG" "$size" "$VM_ADMIN" "$pw" > "$VM_CRED_FILE"
     chmod 600 "$VM_CRED_FILE"
     info "$VM_NAME created ($size); credentials saved to $VM_CRED_FILE"
   fi
 
-  log "[$REGION2] Azure Bastion $bas (browser RDP, ~10 min on first run)"
-  az network vnet subnet show -g "$RG2" --vnet-name "$VNET2" -n AzureBastionSubnet >/dev/null 2>&1 || \
-    az network vnet subnet create -g "$RG2" --vnet-name "$VNET2" -n AzureBastionSubnet --address-prefixes "${c}.11.0/26" -o none
-  az network public-ip show -g "$RG2" -n "$basip" >/dev/null 2>&1 || \
-    az network public-ip create -g "$RG2" -n "$basip" -l "$REGION2" --sku Standard --allocation-method Static -o none
-  az network bastion show -g "$RG2" -n "$bas" >/dev/null 2>&1 || \
-    az network bastion create -g "$RG2" -n "$bas" -l "$REGION2" --vnet-name "$VNET2" \
-      --public-ip-address "$basip" --sku "${BASTION_SKU:-Basic}" -o none
-
+  create_bastion
   test_from_vm
   cat <<VMSUM
 
 =====================================================================
  Test VM ready
 ---------------------------------------------------------------------
- VM          : $VM_NAME in $REGION2 (${RG2}), no public IP
- Connect     : Azure portal -> $VM_NAME -> Connect -> Bastion
+ VM          : $VM_NAME in $TVM_REGION_NAME (${TVM_RG}), no public IP
+ Connect     : Azure portal -> $VM_NAME -> Connect -> Bastion (Developer: 1 session at a time)
  Credentials : cat $VM_CRED_FILE
  Browse      : https://$(az afd endpoint show -g "$RG_GLOBAL" --profile-name "$AFD_PROFILE" --endpoint-name "$AFD_ENDPOINT" --query hostName -o tsv)
-               (header should be BLUE = served by $REGION2_NAME AKS)
+               (should be served by the $TVM_REGION_NAME AKS cluster)
  Re-test     : $0 testvm-run
- Cost saving : az vm deallocate -g $RG2 -n $VM_NAME
+ Cost saving : az vm deallocate -g $TVM_RG -n $VM_NAME
 =====================================================================
 VMSUM
 }
 
 # ----------------------------- Destroy --------------------------------------
 install_prereqs
+# Deployments created before resource group names carried the suffix keep their old
+# names (only if that legacy group holds THIS deployment's registry)
+LEGACY_RG="rg-${PREFIX}-global"
+if [[ "$(az group exists -n "$RG_GLOBAL")" != "true" ]] && az acr show -n "$ACR" -g "$LEGACY_RG" >/dev/null 2>&1; then
+  RG_GLOBAL="$LEGACY_RG"; RG1="rg-${PREFIX}-${R1}"; RG2="rg-${PREFIX}-${R2}"
+  info "Existing deployment found - keeping its resource group names: $RG_GLOBAL, $RG1, $RG2"
+fi
 if [[ "${1:-}" == "destroy" ]]; then
   # Every rg-<prefix>-* group, so groups from earlier layouts (e.g. East US) go too
   mapfile -t DEL < <(az group list --query "[?starts_with(name,'rg-${PREFIX}-')].name" -o tsv)
@@ -400,7 +449,7 @@ if [[ "${1:-}" == "destroy" ]]; then
     [[ "$(az group show -n "$rg" --query properties.provisioningState -o tsv)" == "Deleting" ]] || \
       az group delete -n "$rg" --yes --no-wait
   done
-  if [[ "${2:-}" != "--no-wait" ]]; then
+  if [[ "${2:-}" == "--wait" ]]; then
     for rg in "${DEL[@]}"; do
       info "Waiting for $rg to be deleted (AKS + Cosmos DB take ~10-20 min)..."
       az group wait -n "$rg" --deleted --interval 30 --timeout 3600
@@ -410,12 +459,13 @@ if [[ "${1:-}" == "destroy" ]]; then
     done
     info "All resources deleted."
   else
-    info "Deletion runs in the background; re-run 'destroy' later to purge soft-deleted vaults."
+    info "Deletion runs in the background (~15-20 min). Check progress with:"
+    info "  az group list --query \"[?starts_with(name,'rg-${PREFIX}-')].[name,properties.provisioningState]\" -o table"
+    info "Run '$0 destroy --wait' afterwards to wait for completion and purge the soft-deleted Key Vaults."
   fi
   rm -f "$STATE_FILE" "$VM_CRED_FILE"; exit 0
 fi
 if [[ "${1:-}" == "testvm" || "${1:-}" == "testvm-run" ]]; then
-  REGION2_NAME=$(az account list-locations --query "[?name=='$REGION2'].displayName" -o tsv)
   if [[ "$1" == "testvm" ]]; then create_test_vm; else test_from_vm; fi
   exit 0
 fi
@@ -941,7 +991,14 @@ cat <<SUMMARY
  Test a region  : kubectl --context ${AKS1} -n ${K8S_NS} port-forward svc/${IMAGE_NAME} 8080:80
                   then open http://localhost:8080
  Failover test  : kubectl --context ${AKS1} -n ${K8S_NS} scale deploy/${IMAGE_NAME} --replicas 0
- Test from ${REGION2_NAME}: $0 testvm   (Windows VM + Bastion in ${REGION2})
+ Test VM        : created below in ${TEST_VM_REGION} (re-create: $0 testvm, re-test: $0 testvm-run)
  Tear down      : $0 destroy
 =====================================================================
 SUMMARY
+
+# ----------------------------- Test VM (always) -----------------------------
+if [[ "${SKIP_TEST_VM:-false}" != "true" ]]; then
+  # background + wait so 'set -e' stays active inside the step; a failure doesn't fail the deployment
+  ( create_test_vm ) & TVM_PID=$!
+  wait "$TVM_PID" || info "WARNING: test VM step failed (the platform itself is deployed) - retry with: $0 testvm"
+fi
